@@ -14,19 +14,10 @@ from config_loader import Settings, load_settings
 
 
 LOGGER = logging.getLogger(__name__)
-BTC_SYMBOL = "BTCUSDT"
-ROLLING_WINDOW = 60
+MAX_HORIZON_MINUTES = 120
 
-FEATURE_COLUMNS = [
-    "open_time",
-    "btc_log_return",
-    "btc_volatility",
-    "btc_volume_log",
-    "btc_quote_volume_log",
-    "btc_zscore",
-    "btc_rolling_volatility",
-]
-FLOAT_FEATURE_COLUMNS = FEATURE_COLUMNS[1:]
+TARGET_COLUMNS = ["open_time"] + [f"return_{minute}m" for minute in range(1, MAX_HORIZON_MINUTES + 1)]
+FLOAT_TARGET_COLUMNS = TARGET_COLUMNS[1:]
 
 
 def make_s3_client(settings: Settings):
@@ -62,9 +53,9 @@ def raw_klines_key(symbol: str, day: str, settings: Settings) -> str:
     )
 
 
-def feature_dataset_key(symbol: str, day: str, settings: Settings) -> str:
+def target_dataset_key(symbol: str, day: str, settings: Settings) -> str:
     return (
-        f"{settings.features_prefix.strip('/')}/{settings.feature_dataset_name}/"
+        f"{settings.targets_prefix.strip('/')}/{settings.target_dataset_name}/"
         f"symbol={symbol}/interval={settings.interval}/date={day}/data.parquet"
     )
 
@@ -80,26 +71,20 @@ def s3_key_exists(s3_client, bucket: str, key: str) -> bool:
         raise
 
 
-def read_symbol_klines_day(
-    symbol: str,
-    day: str,
-    settings: Settings,
-    s3_client,
-    required_columns: list[str],
-) -> pd.DataFrame:
+def read_symbol_klines_day(symbol: str, day: str, settings: Settings, s3_client) -> pd.DataFrame:
     key = raw_klines_key(symbol=symbol, day=day, settings=settings)
     obj = s3_client.get_object(Bucket=settings.s3_bucket, Key=key)
     df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+    required_columns = ["open_time", "close"]
     missing_columns = sorted(set(required_columns) - set(df.columns))
     if missing_columns:
-        raise ValueError(f"Missing required klines columns for {symbol}: {missing_columns}")
+        raise ValueError(f"Missing required klines columns: {missing_columns}")
     if df.empty:
         return pd.DataFrame(columns=required_columns)
 
     cleaned = df[required_columns].copy()
     cleaned["open_time"] = pd.to_numeric(cleaned["open_time"], errors="coerce").astype("Int64")
-    for column in [column for column in required_columns if column != "open_time"]:
-        cleaned[column] = pd.to_numeric(cleaned[column], errors="coerce")
+    cleaned["close"] = pd.to_numeric(cleaned["close"], errors="coerce")
     cleaned = (
         cleaned.dropna(subset=["open_time"])
         .drop_duplicates(subset=["open_time"])
@@ -112,93 +97,66 @@ def read_symbol_klines_day(
     return cleaned
 
 
-def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
-    numerator_values = numerator.astype("float64").to_numpy()
-    denominator_values = denominator.astype("float64").to_numpy()
-    result = np.divide(
-        numerator_values,
-        denominator_values,
-        out=np.zeros(len(numerator), dtype="float64"),
-        where=denominator_values != 0,
-    )
-    return pd.Series(result, index=numerator.index)
+def next_day(day: str) -> str:
+    return (pd.Timestamp(day).date() + timedelta(days=1)).isoformat()
 
 
-def previous_day(day: str) -> str:
-    return (pd.Timestamp(day).date() - timedelta(days=1)).isoformat()
+def read_forward_klines_context(symbol: str, day: str, settings: Settings, s3_client) -> pd.DataFrame:
+    frames = [read_symbol_klines_day(symbol=symbol, day=day, settings=settings, s3_client=s3_client)]
+    rows_after_current_day = 0
+    candidate_day = day
 
-
-def read_btc_history_for_day(day: str, settings: Settings, s3_client) -> pd.DataFrame:
-    required_columns = ["open_time", "open", "high", "low", "close", "volume", "quote_volume"]
-    frames = []
-    previous = previous_day(day)
-    previous_key = raw_klines_key(symbol=BTC_SYMBOL, day=previous, settings=settings)
-    if s3_key_exists(s3_client, settings.s3_bucket, previous_key):
-        frames.append(
-            read_symbol_klines_day(
-                symbol=BTC_SYMBOL,
-                day=previous,
-                settings=settings,
-                s3_client=s3_client,
-                required_columns=required_columns,
-            ).tail(ROLLING_WINDOW)
+    while rows_after_current_day < MAX_HORIZON_MINUTES:
+        candidate_day = next_day(candidate_day)
+        key = raw_klines_key(symbol=symbol, day=candidate_day, settings=settings)
+        if not s3_key_exists(s3_client, settings.s3_bucket, key):
+            break
+        future_df = read_symbol_klines_day(
+            symbol=symbol,
+            day=candidate_day,
+            settings=settings,
+            s3_client=s3_client,
         )
+        frames.append(future_df)
+        rows_after_current_day += len(future_df)
 
-    current_key = raw_klines_key(symbol=BTC_SYMBOL, day=day, settings=settings)
-    if not s3_key_exists(s3_client, settings.s3_bucket, current_key):
-        return pd.DataFrame(columns=required_columns + ["is_current_day"])
+    return pd.concat(frames, ignore_index=True).sort_values("open_time").reset_index(drop=True)
 
-    current = read_symbol_klines_day(
-        symbol=BTC_SYMBOL,
-        day=day,
-        settings=settings,
-        s3_client=s3_client,
-        required_columns=required_columns,
+
+def safe_future_return(current_close: pd.Series, future_close: pd.Series) -> pd.Series:
+    current_values = current_close.astype("float64").to_numpy()
+    future_values = future_close.astype("float64").to_numpy()
+    result = np.divide(
+        future_values - current_values,
+        current_values,
+        out=np.zeros(len(current_close), dtype="float64"),
+        where=(current_values != 0) & ~np.isnan(future_values),
     )
-    frames.append(current)
-    history = pd.concat(frames, ignore_index=True)
-    history["is_current_day"] = history["open_time"].isin(current["open_time"])
-    return history.sort_values("open_time").reset_index(drop=True)
+    return pd.Series(result, index=current_close.index)
 
 
-def build_btc_features_for_day(day: str, settings: Settings, s3_client) -> pd.DataFrame:
-    history = read_btc_history_for_day(day=day, settings=settings, s3_client=s3_client)
-    if history.empty:
-        return pd.DataFrame(columns=FEATURE_COLUMNS)
+def build_targets_for_day(symbol: str, day: str, settings: Settings, s3_client) -> pd.DataFrame:
+    current_day = read_symbol_klines_day(symbol=symbol, day=day, settings=settings, s3_client=s3_client)
+    if current_day.empty:
+        return pd.DataFrame(columns=TARGET_COLUMNS)
 
-    previous_close = history["close"].shift(1)
-    ratio = safe_divide(history["close"], previous_close)
-    history["btc_log_return"] = np.where(previous_close.eq(0) | previous_close.isna(), 0.0, np.log(ratio))
-    history["btc_volatility"] = safe_divide(history["high"] - history["low"], history["close"])
-    history["btc_volume_log"] = np.log1p(history["volume"])
-    history["btc_quote_volume_log"] = np.log1p(history["quote_volume"])
-    rolling_mean = history["btc_log_return"].rolling(window=ROLLING_WINDOW, min_periods=1).mean()
-    rolling_std = history["btc_log_return"].rolling(window=ROLLING_WINDOW, min_periods=2).std()
-    history["btc_zscore"] = safe_divide(history["btc_log_return"] - rolling_mean, rolling_std.fillna(0.0))
-    history["btc_rolling_volatility"] = rolling_std.fillna(0.0)
-    return history.loc[history["is_current_day"], FEATURE_COLUMNS].reset_index(drop=True)
+    context = read_forward_klines_context(symbol=symbol, day=day, settings=settings, s3_client=s3_client)
+    close_by_time = context.set_index("open_time")["close"]
 
+    target_df = current_day[["open_time", "close"]].copy()
+    return_columns = {}
+    for horizon in range(1, MAX_HORIZON_MINUTES + 1):
+        future_times = target_df["open_time"] + horizon * 60_000
+        future_close = future_times.map(close_by_time)
+        return_columns[f"return_{horizon}m"] = safe_future_return(target_df["close"], future_close)
 
-def build_features_for_day(symbol: str, day: str, settings: Settings, s3_client) -> pd.DataFrame:
-    backbone = read_symbol_klines_day(
-        symbol=symbol,
-        day=day,
-        settings=settings,
-        s3_client=s3_client,
-        required_columns=["open_time"],
-    )
-    if backbone.empty:
-        return pd.DataFrame(columns=FEATURE_COLUMNS)
-
-    btc_features = build_btc_features_for_day(day=day, settings=settings, s3_client=s3_client)
-    feature_df = backbone.merge(btc_features, on="open_time", how="left")
-    feature_df[FLOAT_FEATURE_COLUMNS] = feature_df[FLOAT_FEATURE_COLUMNS].fillna(0.0)
-    feature_df = feature_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    feature_df = feature_df.sort_values("open_time").reset_index(drop=True)
-    feature_df["open_time"] = feature_df["open_time"].astype("int64")
-    for column in FLOAT_FEATURE_COLUMNS:
-        feature_df[column] = feature_df[column].astype("float32")
-    return feature_df[FEATURE_COLUMNS]
+    target_df = pd.concat([target_df.drop(columns=["close"]), pd.DataFrame(return_columns)], axis=1)
+    target_df = target_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    target_df = target_df.sort_values("open_time").reset_index(drop=True)
+    target_df["open_time"] = target_df["open_time"].astype("int64")
+    for column in FLOAT_TARGET_COLUMNS:
+        target_df[column] = target_df[column].astype("float32")
+    return target_df[TARGET_COLUMNS]
 
 
 def select_dates(available_dates: list[str], start_date: date | None, end_date: date | None) -> list[str]:
@@ -213,7 +171,7 @@ def select_dates(available_dates: list[str], start_date: date | None, end_date: 
     return selected_dates
 
 
-def write_features_for_symbol_to_s3(symbol: str, settings: Settings, s3_client) -> pd.DataFrame:
+def write_targets_for_symbol_to_s3(symbol: str, settings: Settings, s3_client) -> pd.DataFrame:
     available_dates = list_symbol_klines_days(symbol=symbol, settings=settings, s3_client=s3_client)
     selected_dates = select_dates(available_dates, settings.start_date, settings.end_date)
     if not selected_dates:
@@ -224,17 +182,17 @@ def write_features_for_symbol_to_s3(symbol: str, settings: Settings, s3_client) 
 
     rows = []
     for day in selected_dates:
-        key = feature_dataset_key(symbol=symbol, day=day, settings=settings)
+        key = target_dataset_key(symbol=symbol, day=day, settings=settings)
         if settings.skip_existing and s3_key_exists(s3_client, settings.s3_bucket, key):
             LOGGER.info("Skip exists: s3://%s/%s", settings.s3_bucket, key)
             rows.append({"symbol": symbol, "date": day, "rows": None, "key": key, "status": "skipped"})
             continue
-        feature_df = build_features_for_day(symbol, day, settings, s3_client)
+        target_df = build_targets_for_day(symbol=symbol, day=day, settings=settings, s3_client=s3_client)
         buffer = io.BytesIO()
-        feature_df.to_parquet(buffer, index=False, engine="pyarrow", compression="zstd")
+        target_df.to_parquet(buffer, index=False, engine="pyarrow", compression="zstd")
         s3_client.put_object(Bucket=settings.s3_bucket, Key=key, Body=buffer.getvalue())
-        LOGGER.info("Uploaded: s3://%s/%s rows=%s", settings.s3_bucket, key, len(feature_df))
-        rows.append({"symbol": symbol, "date": day, "rows": len(feature_df), "key": key, "status": "uploaded"})
+        LOGGER.info("Uploaded: s3://%s/%s rows=%s", settings.s3_bucket, key, len(target_df))
+        rows.append({"symbol": symbol, "date": day, "rows": len(target_df), "key": key, "status": "uploaded"})
     return pd.DataFrame(rows)
 
 
@@ -248,13 +206,13 @@ def safe_settings_for_logs(settings: Settings) -> dict[str, object]:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     settings = load_settings()
-    LOGGER.info("Starting BTC feature aggregation with settings=%s", safe_settings_for_logs(settings))
+    LOGGER.info("Starting future-return target generation with settings=%s", safe_settings_for_logs(settings))
     s3_client = make_s3_client(settings)
-    results = write_features_for_symbol_to_s3(settings.symbol, settings, s3_client)
+    results = write_targets_for_symbol_to_s3(symbol=settings.symbol, settings=settings, s3_client=s3_client)
     status_counts = results["status"].value_counts(dropna=False).to_dict()
     uploaded_rows = int(results.loc[results["status"] == "uploaded", "rows"].fillna(0).sum())
     LOGGER.info(
-        "Finished BTC feature aggregation: processed_days=%s status_counts=%s uploaded_rows=%s",
+        "Finished future-return target generation: processed_days=%s status_counts=%s uploaded_rows=%s",
         len(results),
         status_counts,
         uploaded_rows,

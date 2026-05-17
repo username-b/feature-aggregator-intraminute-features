@@ -16,9 +16,11 @@ class Settings:
     s3_bucket: str
     raw_prefix: str
     features_prefix: str
+    targets_prefix: str
     symbol: str
     interval: str
     feature_dataset_name: str
+    target_dataset_name: str
     skip_existing: bool
     start_date: date | None
     end_date: date | None
@@ -66,9 +68,11 @@ def load_settings() -> Settings:
         s3_bucket=_required("S3_BUCKET"),
         raw_prefix=_required("RAW_PREFIX"),
         features_prefix=_required("FEATURES_PREFIX"),
+        targets_prefix=_required("TARGETS_PREFIX"),
         symbol=_required("SYMBOL"),
         interval=os.getenv("INTERVAL", "1m"),
         feature_dataset_name=os.getenv("FEATURE_DATASET_NAME", "btc_features"),
+        target_dataset_name=os.getenv("TARGET_DATASET_NAME", "future_returns"),
         skip_existing=_parse_bool(os.getenv("SKIP_EXISTING", "true")),
         start_date=start_date,
         end_date=end_date,

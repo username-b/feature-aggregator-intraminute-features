@@ -1,45 +1,45 @@
-# BTC Features Aggregator
+# Future Returns Target Aggregator
 
-Самодостаточный Docker-проект для генерации minute-level датасета `btc_features` для модели `ADAUSDT`.
+Самодостаточный Docker-проект для генерации target dataset `future_returns` по minute-level `klines` для `ADAUSDT`.
 
-Проект использует ADAUSDT как minute backbone:
+Источник:
 
 ```text
 raw/klines/symbol=ADAUSDT/interval=1m/date=<YYYY-MM-DD>/data.parquet
 ```
 
-и читает BTCUSDT minute klines из:
+Результат:
 
 ```text
-raw/klines/symbol=BTCUSDT/interval=1m/date=<YYYY-MM-DD>/data.parquet
+targets/future_returns/symbol=ADAUSDT/interval=1m/date=<YYYY-MM-DD>/data.parquet
 ```
 
-Результат записывается в:
-
-```text
-features/btc_features/symbol=ADAUSDT/interval=1m/date=<YYYY-MM-DD>/data.parquet
-```
-
-Состав минут итогового parquet в точности повторяет ADAUSDT backbone. Если BTCUSDT не содержит какой-либо минуты backbone, признаки этой строки после join заполняются нулями.
+Состав минут итогового parquet в точности повторяет daily backbone исходного `klines` parquet.
 
 ## Состав выходного parquet
 
 - `open_time`
-- `btc_log_return`
-- `btc_volatility`
-- `btc_volume_log`
-- `btc_quote_volume_log`
-- `btc_zscore`
-- `btc_rolling_volatility`
+- `return_1m`
+- `return_2m`
+- `...`
+- `return_120m`
 
-Все признаки, кроме `open_time`, сохраняются как `float32`. Строки отсортированы по `open_time` по возрастанию.
+Все target-колонки сохраняются как `float32`. Строки отсортированы по `open_time` по возрастанию.
 
 ## Правила расчета
 
-- `btc_log_return` использует предыдущую BTC-минуту, включая предыдущий daily parquet;
-- `btc_zscore` и `btc_rolling_volatility` используют trailing window в 60 минут без future data;
-- если предыдущий BTC parquet отсутствует, первая доступная BTC-минута текущего ряда получает `btc_log_return = 0`;
-- если BTC parquet за день отсутствует целиком, итоговый ADA-backbone сохраняется, а BTC-признаки становятся нулевыми.
+Для каждой минуты `t`:
+
+```text
+return_n(t) = (close_{t+n} - close_t) / close_t
+```
+
+для горизонтов `1m ... 120m`.
+
+- future data использовать разрешено;
+- для последних минут дня автоматически подгружаются следующие daily parquet-файлы, пока не будет доступно минимум 120 минут вперед;
+- если future close отсутствует, соответствующий target равен `0`;
+- если `close_t = 0`, соответствующий target равен `0`.
 
 ## Конфигурация
 
@@ -51,10 +51,11 @@ features/btc_features/symbol=ADAUSDT/interval=1m/date=<YYYY-MM-DD>/data.parquet
 | `S3_ENDPOINT_URL` | да | Endpoint S3-compatible storage |
 | `S3_BUCKET` | да | Bucket с данными |
 | `RAW_PREFIX` | да | Префикс исходных данных |
-| `FEATURES_PREFIX` | да | Префикс выходных данных |
-| `SYMBOL` | да | Символ backbone, для этого pipeline `ADAUSDT` |
+| `FEATURES_PREFIX` | да | Сохраняется для совместимости с окружением |
+| `TARGETS_PREFIX` | да | Префикс target datasets |
+| `SYMBOL` | да | Торговая пара |
 | `INTERVAL` | нет | Интервал свечей, по умолчанию `1m` |
-| `FEATURE_DATASET_NAME` | нет | Имя датасета, по умолчанию `btc_features` |
+| `TARGET_DATASET_NAME` | нет | Имя target dataset, по умолчанию `future_returns` |
 | `SKIP_EXISTING` | нет | Пропускать уже существующие партиции, по умолчанию `true` |
 | `START_DATE` | нет | Нижняя граница периода в формате `YYYY-MM-DD` |
 | `END_DATE` | нет | Верхняя граница периода в формате `YYYY-MM-DD` |
@@ -65,6 +66,6 @@ features/btc_features/symbol=ADAUSDT/interval=1m/date=<YYYY-MM-DD>/data.parquet
 cp .env.example .env
 # заполнить секреты и нужные значения в .env
 
-docker build -t btc-features:test .
-docker run --rm --env-file .env btc-features:test
+docker build -t future-returns:test .
+docker run --rm --env-file .env future-returns:test
 ```

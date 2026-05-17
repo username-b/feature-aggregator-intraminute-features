@@ -1,0 +1,1 @@
+ubuntu_image_checksum = "sha256:6e7016f2c9f4d3c00f48789eb6b9043ba2172ccc1b6b1eaf3ed1e29dd3e52bb3"

@@ -1,0 +1,2 @@
+ubuntu_image_checksum = "sha256:REPLACE_WITH_CURRENT_SHA256"
+# accelerator = "tcg"

@@ -17,6 +17,8 @@ write_files:
       INTERVAL=1m
       FEATURE_DATASET_NAME=intraminute_features
       SKIP_EXISTING=true
+      # START_DATE=2020-02-01
+      # END_DATE=2026-02-01
 
   - path: /opt/feature-jobs/run-job.sh
     owner: root:root

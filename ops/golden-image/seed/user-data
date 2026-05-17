@@ -1,0 +1,18 @@
+#cloud-config
+users:
+  - default
+  - name: packer
+    gecos: Packer Build User
+    groups: [adm, sudo]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+
+chpasswd:
+  expire: false
+  users:
+    - name: packer
+      password: packer
+      type: text
+
+ssh_pwauth: true

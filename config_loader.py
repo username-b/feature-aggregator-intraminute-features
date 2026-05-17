@@ -68,7 +68,7 @@ def load_settings() -> Settings:
         features_prefix=_required("FEATURES_PREFIX"),
         symbol=_required("SYMBOL"),
         interval=os.getenv("INTERVAL", "1m"),
-        feature_dataset_name=os.getenv("FEATURE_DATASET_NAME", "intraminute_features"),
+        feature_dataset_name=os.getenv("FEATURE_DATASET_NAME", "price_pressure"),
         skip_existing=_parse_bool(os.getenv("SKIP_EXISTING", "true")),
         start_date=start_date,
         end_date=end_date,

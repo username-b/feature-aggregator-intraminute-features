@@ -17,18 +17,17 @@ LOGGER = logging.getLogger(__name__)
 
 FEATURE_COLUMNS = [
     "open_time",
-    "log_close",
-    "candle_range",
-    "body",
-    "upper_wick",
-    "lower_wick",
-    "body_norm",
-    "wick_upper_norm",
-    "wick_lower_norm",
-    "volume_log",
-    "quote_volume_log",
-    "taker_buy_ratio",
+    "VWAP",
+    "PI_buy",
+    "PI_sell",
+    "PI_total",
+    "F_eff",
+    "F_PI",
+    "F_asymmetry",
+    "VWAP_pos",
 ]
+
+FLOAT_FEATURE_COLUMNS = FEATURE_COLUMNS[1:]
 
 
 def make_s3_client(settings: Settings):
@@ -41,11 +40,7 @@ def make_s3_client(settings: Settings):
     )
 
 
-def list_symbol_klines_days(
-    symbol: str,
-    settings: Settings,
-    s3_client,
-) -> list[str]:
+def list_symbol_klines_days(symbol: str, settings: Settings, s3_client) -> list[str]:
     source_prefix = (
         f"{settings.raw_prefix.strip('/')}/klines/"
         f"symbol={symbol}/interval={settings.interval}/"
@@ -70,6 +65,13 @@ def raw_klines_key(symbol: str, day: str, settings: Settings) -> str:
     )
 
 
+def raw_agg_trades_key(symbol: str, day: str, settings: Settings) -> str:
+    return (
+        f"{settings.raw_prefix.strip('/')}/aggTrades/"
+        f"symbol={symbol}/date={day}/data.parquet"
+    )
+
+
 def feature_dataset_key(symbol: str, day: str, settings: Settings) -> str:
     return (
         f"{settings.features_prefix.strip('/')}/{settings.feature_dataset_name}/"
@@ -88,26 +90,12 @@ def s3_key_exists(s3_client, bucket: str, key: str) -> bool:
         raise
 
 
-def read_symbol_klines_day(
-    symbol: str,
-    day: str,
-    settings: Settings,
-    s3_client,
-) -> pd.DataFrame:
+def read_symbol_klines_day(symbol: str, day: str, settings: Settings, s3_client) -> pd.DataFrame:
     key = raw_klines_key(symbol=symbol, day=day, settings=settings)
     obj = s3_client.get_object(Bucket=settings.s3_bucket, Key=key)
     df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
 
-    required_columns = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quote_volume",
-        "taker_buy_base",
-    ]
+    required_columns = ["open_time", "high", "low", "close"]
     missing_columns = sorted(set(required_columns) - set(df.columns))
     if missing_columns:
         raise ValueError(f"Missing required klines columns: {missing_columns}")
@@ -117,17 +105,7 @@ def read_symbol_klines_day(
 
     cleaned = df[required_columns].copy()
     cleaned["open_time"] = pd.to_numeric(cleaned["open_time"], errors="coerce").astype("Int64")
-
-    numeric_columns = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quote_volume",
-        "taker_buy_base",
-    ]
-    for column in numeric_columns:
+    for column in ["high", "low", "close"]:
         cleaned[column] = pd.to_numeric(cleaned[column], errors="coerce")
 
     cleaned = (
@@ -144,63 +122,146 @@ def read_symbol_klines_day(
     return cleaned
 
 
-def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
-    result = np.divide(
-        numerator.astype("float64"),
-        denominator.astype("float64"),
-        out=np.zeros(len(numerator), dtype="float64"),
-        where=denominator.astype("float64").to_numpy() != 0,
-    )
-    return pd.Series(result, index=numerator.index)
-
-
-def build_features_for_day(
+def read_symbol_agg_trades_day(
     symbol: str,
     day: str,
     settings: Settings,
     s3_client,
 ) -> pd.DataFrame:
-    df = read_symbol_klines_day(
-        symbol=symbol,
-        day=day,
-        settings=settings,
-        s3_client=s3_client,
-    )
+    key = raw_agg_trades_key(symbol=symbol, day=day, settings=settings)
+    obj = s3_client.get_object(Bucket=settings.s3_bucket, Key=key)
+    df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+
+    required_columns = ["transact_time", "price", "quantity", "is_buyer_maker"]
+    missing_columns = sorted(set(required_columns) - set(df.columns))
+    if missing_columns:
+        raise ValueError(f"Missing required aggTrades columns: {missing_columns}")
 
     if df.empty:
+        return pd.DataFrame(columns=required_columns + ["minute_bucket"])
+
+    cleaned = df[required_columns].copy()
+    cleaned["transact_time"] = pd.to_numeric(cleaned["transact_time"], errors="coerce").astype("Int64")
+    cleaned["price"] = pd.to_numeric(cleaned["price"], errors="coerce")
+    cleaned["quantity"] = pd.to_numeric(cleaned["quantity"], errors="coerce")
+    cleaned["is_buyer_maker"] = cleaned["is_buyer_maker"].astype("boolean")
+    cleaned = cleaned.dropna(subset=["transact_time", "price", "quantity", "is_buyer_maker"])
+
+    if cleaned.empty:
+        return pd.DataFrame(columns=required_columns + ["minute_bucket"])
+
+    transact_time_utc = pd.to_datetime(cleaned["transact_time"].astype("int64"), unit="ms", utc=True)
+    cleaned["minute_bucket"] = transact_time_utc.dt.floor("min").astype("int64") // 10**6
+
+    return cleaned.sort_values(["minute_bucket", "transact_time"], kind="stable").reset_index(drop=True)
+
+
+def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    numerator_values = numerator.astype("float64").to_numpy()
+    denominator_values = denominator.astype("float64").to_numpy()
+    result = np.divide(
+        numerator_values,
+        denominator_values,
+        out=np.zeros(len(numerator), dtype="float64"),
+        where=denominator_values != 0,
+    )
+    return pd.Series(result, index=numerator.index)
+
+
+def build_trade_features(agg_trades: pd.DataFrame) -> pd.DataFrame:
+    if agg_trades.empty:
+        return pd.DataFrame(
+            columns=[
+                "open_time",
+                "VWAP",
+                "PI_buy",
+                "PI_sell",
+                "PI_total",
+                "F_PI",
+            ]
+        )
+
+    trades = agg_trades.copy()
+    trades["quote_qty"] = trades["price"] * trades["quantity"]
+    trades["is_buy"] = ~trades["is_buyer_maker"]
+    trades["sign"] = np.where(trades["is_buy"], 1.0, -1.0)
+
+    grouped = trades.groupby("minute_bucket", sort=True)
+    minute_totals = grouped.agg(
+        total_quantity=("quantity", "sum"),
+        quote_qty_sum=("quote_qty", "sum"),
+    )
+    minute_totals["VWAP"] = safe_divide(minute_totals["quote_qty_sum"], minute_totals["total_quantity"])
+
+    trades = trades.join(minute_totals["VWAP"], on="minute_bucket")
+    trades["delta_p"] = trades["price"] - trades["VWAP"]
+    trades["PI_i"] = trades["sign"] * trades["quantity"] * trades["delta_p"]
+    trades["price_diff_sq"] = grouped["price"].diff().pow(2).fillna(0.0)
+
+    impact = trades.groupby(["minute_bucket", "is_buy"], sort=True)["PI_i"].sum().unstack(fill_value=0.0)
+    pi_buy = impact[True] if True in impact.columns else pd.Series(0.0, index=impact.index)
+    pi_sell = impact[False] if False in impact.columns else pd.Series(0.0, index=impact.index)
+
+    rv = trades.groupby("minute_bucket", sort=True)["price_diff_sq"].sum()
+
+    features = pd.DataFrame(index=minute_totals.index)
+    features["open_time"] = features.index.astype("int64")
+    features["VWAP"] = minute_totals["VWAP"]
+    features["PI_buy"] = pi_buy.reindex(features.index, fill_value=0.0)
+    features["PI_sell"] = pi_sell.reindex(features.index, fill_value=0.0)
+    features["PI_total"] = features["PI_buy"] + features["PI_sell"]
+    features["F_PI"] = safe_divide(features["PI_total"], rv * minute_totals["total_quantity"])
+
+    return features.reset_index(drop=True)
+
+
+def build_features_for_day(symbol: str, day: str, settings: Settings, s3_client) -> pd.DataFrame:
+    backbone = read_symbol_klines_day(symbol=symbol, day=day, settings=settings, s3_client=s3_client)
+    if backbone.empty:
         return pd.DataFrame(columns=FEATURE_COLUMNS)
 
-    candle_range = df["high"] - df["low"]
-    body = df["close"] - df["open"]
-    upper_wick = df["high"] - df[["open", "close"]].max(axis=1)
-    lower_wick = df[["open", "close"]].min(axis=1) - df["low"]
+    agg_trades = read_symbol_agg_trades_day(symbol=symbol, day=day, settings=settings, s3_client=s3_client)
+    trade_features = build_trade_features(agg_trades)
 
-    feature_df = pd.DataFrame(
-        {
-            "open_time": df["open_time"].astype("int64"),
-            "log_close": np.log(df["close"]),
-            "candle_range": candle_range,
-            "body": body,
-            "upper_wick": upper_wick,
-            "lower_wick": lower_wick,
-            "body_norm": safe_divide(body, candle_range),
-            "wick_upper_norm": safe_divide(upper_wick, candle_range),
-            "wick_lower_norm": safe_divide(lower_wick, candle_range),
-            "volume_log": np.log1p(df["volume"]),
-            "quote_volume_log": np.log1p(df["quote_volume"]),
-            "taker_buy_ratio": safe_divide(df["taker_buy_base"], df["volume"]),
-        }
+    feature_df = backbone.merge(trade_features, on="open_time", how="left")
+    trade_value_columns = ["VWAP", "PI_buy", "PI_sell", "PI_total", "F_PI"]
+    feature_df[trade_value_columns] = feature_df[trade_value_columns].fillna(0.0)
+
+    buy_volume = (
+        agg_trades.loc[~agg_trades["is_buyer_maker"]]
+        .groupby("minute_bucket", sort=True)["quantity"]
+        .sum()
     )
+    sell_volume = (
+        agg_trades.loc[agg_trades["is_buyer_maker"]]
+        .groupby("minute_bucket", sort=True)["quantity"]
+        .sum()
+    )
+    feature_df["V_buy_base"] = feature_df["open_time"].map(buy_volume).fillna(0.0)
+    feature_df["V_sell_base"] = feature_df["open_time"].map(sell_volume).fillna(0.0)
 
-    feature_df = feature_df.replace([np.inf, -np.inf], np.nan).fillna(0)
-    return feature_df[FEATURE_COLUMNS].reset_index(drop=True)
+    volume_imbalance_abs = (feature_df["V_buy_base"] - feature_df["V_sell_base"]).abs()
+    feature_df["F_eff"] = safe_divide(feature_df["close"] - feature_df["VWAP"], volume_imbalance_abs)
+    asymmetry_denominator = feature_df["PI_buy"] + feature_df["PI_sell"].abs()
+    feature_df["F_asymmetry"] = safe_divide(
+        feature_df["PI_buy"] - feature_df["PI_sell"].abs(),
+        asymmetry_denominator,
+    )
+    feature_df["VWAP_pos"] = safe_divide(feature_df["close"] - feature_df["VWAP"], feature_df["high"] - feature_df["low"])
+
+    no_trade_mask = feature_df["V_buy_base"].eq(0) & feature_df["V_sell_base"].eq(0)
+    feature_df.loc[no_trade_mask, FLOAT_FEATURE_COLUMNS] = 0.0
+
+    feature_df = feature_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    feature_df = feature_df.sort_values("open_time").reset_index(drop=True)
+    feature_df["open_time"] = feature_df["open_time"].astype("int64")
+    for column in FLOAT_FEATURE_COLUMNS:
+        feature_df[column] = feature_df[column].astype("float32")
+
+    return feature_df[FEATURE_COLUMNS]
 
 
-def select_dates(
-    available_dates: list[str],
-    start_date: date | None,
-    end_date: date | None,
-) -> list[str]:
+def select_dates(available_dates: list[str], start_date: date | None, end_date: date | None) -> list[str]:
     selected_dates = []
     for day in available_dates:
         parsed_day = pd.Timestamp(day).date()
@@ -212,11 +273,7 @@ def select_dates(
     return selected_dates
 
 
-def write_features_for_symbol_to_s3(
-    symbol: str,
-    settings: Settings,
-    s3_client,
-) -> pd.DataFrame:
+def write_features_for_symbol_to_s3(symbol: str, settings: Settings, s3_client) -> pd.DataFrame:
     available_dates = list_symbol_klines_days(symbol=symbol, settings=settings, s3_client=s3_client)
     selected_dates = select_dates(
         available_dates=available_dates,
@@ -239,13 +296,7 @@ def write_features_for_symbol_to_s3(
             rows.append({"symbol": symbol, "date": day, "rows": None, "key": key, "status": "skipped"})
             continue
 
-        feature_df = build_features_for_day(
-            symbol=symbol,
-            day=day,
-            settings=settings,
-            s3_client=s3_client,
-        )
-
+        feature_df = build_features_for_day(symbol=symbol, day=day, settings=settings, s3_client=s3_client)
         buffer = io.BytesIO()
         feature_df.to_parquet(buffer, index=False, engine="pyarrow", compression="zstd")
         s3_client.put_object(Bucket=settings.s3_bucket, Key=key, Body=buffer.getvalue())
@@ -264,25 +315,17 @@ def safe_settings_for_logs(settings: Settings) -> dict[str, object]:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     settings = load_settings()
-    LOGGER.info("Starting feature aggregation with settings=%s", safe_settings_for_logs(settings))
+    LOGGER.info("Starting price-pressure feature aggregation with settings=%s", safe_settings_for_logs(settings))
 
     s3_client = make_s3_client(settings)
-    results = write_features_for_symbol_to_s3(
-        symbol=settings.symbol,
-        settings=settings,
-        s3_client=s3_client,
-    )
+    results = write_features_for_symbol_to_s3(symbol=settings.symbol, settings=settings, s3_client=s3_client)
 
     status_counts = results["status"].value_counts(dropna=False).to_dict()
     uploaded_rows = int(results.loc[results["status"] == "uploaded", "rows"].fillna(0).sum())
     LOGGER.info(
-        "Finished feature aggregation: processed_days=%s status_counts=%s uploaded_rows=%s",
+        "Finished price-pressure feature aggregation: processed_days=%s status_counts=%s uploaded_rows=%s",
         len(results),
         status_counts,
         uploaded_rows,

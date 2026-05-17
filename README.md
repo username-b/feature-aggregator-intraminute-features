@@ -1,32 +1,40 @@
-# Intraminute Features Aggregator
+# Price Pressure Features Aggregator
 
-Самодостаточный Docker-проект для генерации одного логического блока фичей: `intraminute_features`.
+Самодостаточный Docker-проект для генерации minute-level датасета `price_pressure`.
 
-Проект читает минутные свечи из S3-совместимого хранилища:
+Проект использует:
 
 ```text
 raw/klines/symbol=<SYMBOL>/interval=<INTERVAL>/date=<YYYY-MM-DD>/data.parquet
+raw/aggTrades/symbol=<SYMBOL>/date=<YYYY-MM-DD>/data.parquet
 ```
 
-и записывает рассчитанные фичи в:
+и записывает результат в:
 
 ```text
-features/intraminute_features/symbol=<SYMBOL>/interval=<INTERVAL>/date=<YYYY-MM-DD>/data.parquet
+features/price_pressure/symbol=<SYMBOL>/interval=<INTERVAL>/date=<YYYY-MM-DD>/data.parquet
 ```
 
-## Состав фичей
+Minute backbone берется из raw `klines`: состав минут итогового parquet в точности повторяет `open_time` из свечей. Если для минуты нет сделок в `aggTrades`, строка все равно создается, а все числовые признаки равны `0`.
 
-- `log_close`
-- `candle_range`
-- `body`
-- `upper_wick`
-- `lower_wick`
-- `body_norm`
-- `wick_upper_norm`
-- `wick_lower_norm`
-- `volume_log`
-- `quote_volume_log`
-- `taker_buy_ratio`
+## Состав выходного parquet
+
+- `open_time`
+- `VWAP`
+- `PI_buy`
+- `PI_sell`
+- `PI_total`
+- `F_eff`
+- `F_PI`
+- `F_asymmetry`
+- `VWAP_pos`
+
+Все числовые признаки, кроме `open_time`, сохраняются как `float32`. Строки отсортированы по `open_time` по возрастанию.
+
+## Семантика сторон
+
+- `is_buyer_maker = false` → агрессивная покупка (`buy`)
+- `is_buyer_maker = true` → агрессивная продажа (`sell`)
 
 ## Конфигурация
 
@@ -43,7 +51,7 @@ features/intraminute_features/symbol=<SYMBOL>/interval=<INTERVAL>/date=<YYYY-MM-
 | `FEATURES_PREFIX` | да | Префикс выходных данных |
 | `SYMBOL` | да | Торговая пара |
 | `INTERVAL` | нет | Интервал свечей, по умолчанию `1m` |
-| `FEATURE_DATASET_NAME` | нет | Имя датасета фичей, по умолчанию `intraminute_features` |
+| `FEATURE_DATASET_NAME` | нет | Имя датасета, по умолчанию `price_pressure` |
 | `SKIP_EXISTING` | нет | Пропускать уже существующие партиции, по умолчанию `true` |
 | `START_DATE` | нет | Нижняя граница периода в формате `YYYY-MM-DD` |
 | `END_DATE` | нет | Верхняя граница периода в формате `YYYY-MM-DD` |
@@ -54,45 +62,6 @@ features/intraminute_features/symbol=<SYMBOL>/interval=<INTERVAL>/date=<YYYY-MM-
 cp .env.example .env
 # заполнить секреты и нужные значения в .env
 
-docker build -t intraminute-features:test .
-docker run --rm --env-file .env intraminute-features:test
+docker build -t price-pressure-features:test .
+docker run --rm --env-file .env price-pressure-features:test
 ```
-
-## Запуск на VM
-
-Предполагается, что VM уже создана из пользовательского образа, в котором установлены Docker и git.
-
-```bash
-git clone <repo-url>
-cd feature-aggregator-intraminute-features
-cp .env.example .env
-# заполнить .env
-
-docker build -t intraminute-features:v0.1.0 .
-docker run --rm --env-file .env intraminute-features:v0.1.0
-```
-
-## Версионирование
-
-Рекомендуемый порядок:
-
-- git tag фиксирует версию исходного кода;
-- Docker tag повторяет версию git tag;
-- при необходимости дополнительно ставится tag с git SHA.
-
-Пример:
-
-```text
-intraminute-features:v0.1.0
-intraminute-features:git-a1b2c3d
-```
-
-## Основной файл для изменений
-
-Обычная новая версия логики фичей должна затрагивать прежде всего:
-
-```text
-aggregate_features.py
-```
-
-Остальные файлы меняются только при изменении интерфейса конфигурации, зависимостей или эксплуатационного процесса.

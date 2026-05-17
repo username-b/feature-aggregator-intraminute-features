@@ -1,44 +1,47 @@
-# Price Pressure Features Aggregator
+# BTC Features Aggregator
 
-Самодостаточный Docker-проект для генерации minute-level датасета `price_pressure`.
+Самодостаточный Docker-проект для генерации minute-level датасета `btc_features` для модели `ADAUSDT`.
 
-Проект использует:
-
-```text
-raw/klines/symbol=<SYMBOL>/interval=<INTERVAL>/date=<YYYY-MM-DD>/data.parquet
-raw/aggTrades/symbol=<SYMBOL>/date=<YYYY-MM-DD>/data.parquet
-```
-
-и записывает результат в:
+Проект использует ADAUSDT как minute backbone:
 
 ```text
-features/price_pressure/symbol=<SYMBOL>/interval=<INTERVAL>/date=<YYYY-MM-DD>/data.parquet
+raw/klines/symbol=ADAUSDT/interval=1m/date=<YYYY-MM-DD>/data.parquet
 ```
 
-Minute backbone берется из raw `klines`: состав минут итогового parquet в точности повторяет `open_time` из свечей. Если для минуты нет сделок в `aggTrades`, строка все равно создается, а все числовые признаки равны `0`.
+и читает BTCUSDT minute klines из:
+
+```text
+raw/klines/symbol=BTCUSDT/interval=1m/date=<YYYY-MM-DD>/data.parquet
+```
+
+Результат записывается в:
+
+```text
+features/btc_features/symbol=ADAUSDT/interval=1m/date=<YYYY-MM-DD>/data.parquet
+```
+
+Состав минут итогового parquet в точности повторяет ADAUSDT backbone. Если BTCUSDT не содержит какой-либо минуты backbone, признаки этой строки после join заполняются нулями.
 
 ## Состав выходного parquet
 
 - `open_time`
-- `VWAP`
-- `PI_buy`
-- `PI_sell`
-- `PI_total`
-- `F_eff`
-- `F_PI`
-- `F_asymmetry`
-- `VWAP_pos`
+- `btc_log_return`
+- `btc_volatility`
+- `btc_volume_log`
+- `btc_quote_volume_log`
+- `btc_zscore`
+- `btc_rolling_volatility`
 
-Все числовые признаки, кроме `open_time`, сохраняются как `float32`. Строки отсортированы по `open_time` по возрастанию.
+Все признаки, кроме `open_time`, сохраняются как `float32`. Строки отсортированы по `open_time` по возрастанию.
 
-## Семантика сторон
+## Правила расчета
 
-- `is_buyer_maker = false` → агрессивная покупка (`buy`)
-- `is_buyer_maker = true` → агрессивная продажа (`sell`)
+- `btc_log_return` использует предыдущую BTC-минуту, включая предыдущий daily parquet;
+- `btc_zscore` и `btc_rolling_volatility` используют trailing window в 60 минут без future data;
+- если предыдущий BTC parquet отсутствует, первая доступная BTC-минута текущего ряда получает `btc_log_return = 0`;
+- если BTC parquet за день отсутствует целиком, итоговый ADA-backbone сохраняется, а BTC-признаки становятся нулевыми.
 
 ## Конфигурация
-
-Настройки передаются через переменные окружения. Для старта скопируйте `.env.example` в `.env`.
 
 | Переменная | Обязательна | Описание |
 |---|---:|---|
@@ -49,9 +52,9 @@ Minute backbone берется из raw `klines`: состав минут ито
 | `S3_BUCKET` | да | Bucket с данными |
 | `RAW_PREFIX` | да | Префикс исходных данных |
 | `FEATURES_PREFIX` | да | Префикс выходных данных |
-| `SYMBOL` | да | Торговая пара |
+| `SYMBOL` | да | Символ backbone, для этого pipeline `ADAUSDT` |
 | `INTERVAL` | нет | Интервал свечей, по умолчанию `1m` |
-| `FEATURE_DATASET_NAME` | нет | Имя датасета, по умолчанию `price_pressure` |
+| `FEATURE_DATASET_NAME` | нет | Имя датасета, по умолчанию `btc_features` |
 | `SKIP_EXISTING` | нет | Пропускать уже существующие партиции, по умолчанию `true` |
 | `START_DATE` | нет | Нижняя граница периода в формате `YYYY-MM-DD` |
 | `END_DATE` | нет | Верхняя граница периода в формате `YYYY-MM-DD` |
@@ -62,6 +65,6 @@ Minute backbone берется из raw `klines`: состав минут ито
 cp .env.example .env
 # заполнить секреты и нужные значения в .env
 
-docker build -t price-pressure-features:test .
-docker run --rm --env-file .env price-pressure-features:test
+docker build -t btc-features:test .
+docker run --rm --env-file .env btc-features:test
 ```
